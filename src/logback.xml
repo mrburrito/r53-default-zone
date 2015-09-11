@@ -1,0 +1,16 @@
+<configuration>
+    <appender name="console" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="ch.qos.logback.classic.encoder.PatternLayoutEncoder">
+            <!--<pattern>%date %-5level %logger{25} - %msg%n</pattern>-->
+            <pattern>[%logger{25}] %-5level - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <root level="error">
+        <appender-ref ref="console" />
+    </root>
+
+    <logger name="ZoneBuilder" level="info"/>
+    <!--<logger name="com.amazonaws" level="debug"/>-->
+    <!--<logger name="org.apache.http.wire" level="debug"/>-->
+</configuration>
