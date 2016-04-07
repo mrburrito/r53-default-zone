@@ -2,7 +2,7 @@
         @Grab(group='ch.qos.logback', module='logback-classic', version='1.0.+'),
         @Grab(group='org.slf4j', module='log4j-over-slf4j', version='1.7.+'),
         @Grab(group='org.slf4j', module='jcl-over-slf4j', version='1.7.+'),
-        @Grab(group='com.amazonaws',module='aws-java-sdk-route53',version='1.10.+'),
+        @Grab(group='com.amazonaws',module='aws-java-sdk-route53',version='1.10.67+'),
         @Grab(group='commons-net',module='commons-net',version='3.3')
 ])
 import com.amazonaws.services.route53.AmazonRoute53
@@ -11,10 +11,12 @@ import com.amazonaws.services.route53.model.Change
 import com.amazonaws.services.route53.model.ChangeAction
 import com.amazonaws.services.route53.model.ChangeBatch
 import com.amazonaws.services.route53.model.ChangeResourceRecordSetsRequest
+import com.amazonaws.services.route53.model.InvalidChangeBatchException
 import com.amazonaws.services.route53.model.RRType
 import com.amazonaws.services.route53.model.ResourceRecord
 import com.amazonaws.services.route53.model.ResourceRecordSet
 import groovy.util.logging.Slf4j
+import java.util.regex.Matcher
 import org.apache.commons.net.util.SubnetUtils
 import org.apache.commons.net.util.SubnetUtils.SubnetInfo
 
@@ -75,8 +77,8 @@ try {
     System.exit 1
 }
 
-String domain = opts.d.trim().toLowerCase()
-if (!(domain ==~ /^([a-z][-a-z0-9]*\.)+[a-z]{2,}$/)) {
+String domain = opts.d ? opts.d.trim().toLowerCase() : null
+if (domain && !(domain ==~ /^([a-z][-a-z0-9]*\.)+[a-z]{2,}$/)) {
     println "Invalid domain: ${domain}"
     return 1
 }
@@ -130,6 +132,8 @@ class ZoneBuilder {
     final AmazonRoute53 route53
     private int forwardRecords
     private int reverseRecords
+    private int forwardRecordErrors
+    private int reverseRecordErrors
 
     ZoneBuilder(Map args) {
         forwardZone = args['forwardZone']
@@ -142,6 +146,7 @@ class ZoneBuilder {
     }
 
     void generateDefaultRecords() {
+
         List<ChangeSet> changeSets = []
         if (forwardZone) {
             changeSets << new ChangeSet(ZoneType.FORWARD)
@@ -152,6 +157,8 @@ class ZoneBuilder {
 
         forwardRecords = 0
         reverseRecords = 0
+        forwardRecordErrors = 0
+        reverseRecordErrors = 0
 
         subnet.allAddresses.each { addr ->
             changeSets.each { it << addr }
@@ -160,10 +167,10 @@ class ZoneBuilder {
 
         String ipRange = "${subnet.lowAddress} - ${subnet.highAddress}"
         if (forwardZone) {
-            log.info "${ipRange} (FORWARD): ${op} ${forwardRecords} records processed"
+            log.info "${ipRange} (FORWARD): ${op} ${forwardRecords} records processed; ${forwardRecordErrors} errors"
         }
         if (reverseZone) {
-            log.info "${ipRange} (REVERSE): ${op} ${reverseRecords} records processed"
+            log.info "${ipRange} (REVERSE): ${op} ${reverseRecords} records processed; ${reverseRecordErrors} errors"
         }
     }
 
@@ -173,7 +180,7 @@ class ZoneBuilder {
      */
     class ChangeSet {
         final ZoneType zone
-        private List changes = []
+        private Map changes = [:]
         private int valueLength = 0
         private String startAddr
         private String endAddr
@@ -208,11 +215,16 @@ class ZoneBuilder {
             }
             endAddr = addr
             valueLength += value.length()
-            changes << new Change().withAction(op.action).withResourceRecordSet(new ResourceRecordSet().
-                    withName(name).
-                    withType(zone.recordType).
-                    withTTL(TTL).
-                    withResourceRecords(new ResourceRecord().withValue(value)))
+            log.debug("${op}: ${name}=${value}")
+            changes[name] = new Change(
+                    action: op.action,
+                    resourceRecordSet: new ResourceRecordSet(
+                            name: name,
+                            type: zone.recordType,
+                            TTL: TTL,
+                            resourceRecords: [ new ResourceRecord(value: value) ]
+                    )
+            )
             this
         }
 
@@ -223,7 +235,7 @@ class ZoneBuilder {
         void submit() {
             if (changes) {
                 ChangeResourceRecordSetsRequest request = new ChangeResourceRecordSetsRequest().
-                        withChangeBatch(new ChangeBatch().withChanges(changes))
+                        withChangeBatch(new ChangeBatch().withChanges(changes.values()))
                 switch (zone) {
                     case ZoneType.FORWARD:
                         request.hostedZoneId = forwardZone
@@ -247,11 +259,40 @@ class ZoneBuilder {
                     startAddr = null
                     endAddr = null
                     valueLength = 0
-                } catch (e) {
-                    log.error "${startAddr} - ${endAddr} (${zone}): ${op} ${changes.size()} records -- ERROR: ${e}"
-                    System.exit 1
+                } catch (InvalidChangeBatchException icbe) {
+                    // remove offending addresses and retry if this batch is not empty
+                    String messages = icbe.messages?.join("  ")?.trim() ?: icbe.message
+                    log.debug("Processing invalid change batch with messages:\n${icbe.messages?.join('\n\t') ?: icbe.message}")
+                    int changeCount = changes.size()
+                    (messages =~ /record set \[name='(\S+)\.'/)?.each {
+                        String target = it[1]
+                        log.debug("Unable to ${op} ${target}")
+                        changes.remove(target)
+                        switch (zone) {
+                            case ZoneType.FORWARD:
+                                forwardRecordErrors++
+                                break
+                            case ZoneType.REVERSE:
+                                reverseRecordErrors++
+                                break
+                        }
+                    }
+                    if (changeCount != changes.size()) {
+                        log.debug("Resubmitting ${changes.size()}/${changeCount} changes.")
+                        submit()
+                    } else {
+                        log.warn("Unable to identify bad changes.")
+                        die(icbe)
+                    }
+                } catch (Exception e) {
+                    die(e)
                 }
             }
+        }
+
+        void die(Throwable ex) {
+            log.error "${startAddr} - ${endAddr} (${zone}): ${op} ${changes.size()} records -- ERROR: ${ex}"
+            System.exit 1
         }
     }
 }
